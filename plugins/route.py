@@ -13,7 +13,7 @@ from TechVJ.util.custom_dl import ByteStreamer
 from TechVJ.util.time_format import get_readable_time
 from TechVJ.util.render_template import render_page
 from TechVJ.util.link_utils import validate_link
-from TechVJ.util.bucket_storage import bucket_enabled, get_presigned_url
+from TechVJ.util.bucket_storage import bucket_enabled, get_cached_presigned_url, migrate_in_background
 from database.connections_mdb import increment_video_download
 
 routes = web.RouteTableDef()
@@ -75,13 +75,45 @@ async def stream_handler(request: web.Request):
         raise web.HTTPInternalServerError(text=str(e))
 
 
+def _preparing_response(file_id: int, retry_seconds: int = 4):
+    # Tiny HTML page only - no video bytes touch Railway. Auto-refreshes
+    # until the background migration finishes and the bucket redirect
+    # becomes available.
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="{retry_seconds}">
+<title>Preparing your video...</title>
+<style>
+body {{ font-family: sans-serif; background:#0f0f0f; color:#eee; display:flex;
+        align-items:center; justify-content:center; height:100vh; margin:0; }}
+.box {{ text-align:center; }}
+.spinner {{ width:36px; height:36px; margin:0 auto 16px; border:4px solid #333;
+            border-top-color:#4da3ff; border-radius:50%; animation:spin 1s linear infinite; }}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="spinner"></div>
+<p>Preparing your video for streaming...<br>This page will refresh automatically.</p>
+</div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type="text/html", status=202)
+
+
 @routes.get(r"/media/{path:\S+}", allow_head=True)
 async def bucket_media_handler(request: web.Request):
-    """Validate the signed link, then redirect the browser directly to the Railway Bucket.
+    """Redirect to the Railway Bucket once the file is cached there.
 
-    The Railway service never sends the video bytes to the viewer. The first request
-    migrates the Telegram file into the bucket (one-time service egress); subsequent
-    requests only return a short-lived presigned bucket URL.
+    Video bytes never pass through Railway - the bot pre-warms the bucket
+    cache as soon as a link is generated (see link_utils.make_stream_links),
+    so this route usually just redirects immediately. If the migration
+    hasn't finished yet (e.g. link opened right away, or a very large file),
+    this shows a small "preparing" page that auto-refreshes rather than
+    streaming the video through Railway or hanging the connection.
     """
     try:
         path = request.match_info["path"].lstrip("/")
@@ -103,21 +135,27 @@ async def bucket_media_handler(request: web.Request):
             return _expired_response()
 
         if not bucket_enabled():
-            # Fail closed: never fall back to Telegram -> Railway -> user streaming,
-            # otherwise the Railway egress bill can grow without bound.
+            # Fail closed: never stream video bytes through Railway.
             raise web.HTTPServiceUnavailable(
                 text="Video delivery storage is temporarily unavailable. Please try again later."
             )
 
         started = time.monotonic()
-        logging.info("Preparing bucket media: file_id=%s", file_id)
-        target = await get_presigned_url(file_id, int(expires))
-        logging.info(
-            "Bucket media ready: file_id=%s elapsed=%.2fs",
-            file_id,
-            time.monotonic() - started,
-        )
-        raise web.HTTPFound(location=target)
+        cached_target = await get_cached_presigned_url(file_id, int(expires))
+        if cached_target:
+            logging.info(
+                "Bucket media ready: file_id=%s elapsed=%.2fs",
+                file_id,
+                time.monotonic() - started,
+            )
+            raise web.HTTPFound(location=cached_target)
+
+        # Not cached yet - make sure a migration is actually running (covers
+        # the case this link was generated before the pre-warm code existed,
+        # or the background task died) and show a lightweight waiting page
+        # instead of hanging the request or falling back to Railway streaming.
+        migrate_in_background(file_id)
+        return _preparing_response(file_id)
     except web.HTTPException:
         raise
     except InvalidHash as e:
