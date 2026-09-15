@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
 from info import DATABASE_NAME, OTHER_DB_URI, LOG_CHANNEL
-from TechVJ.bot import TechVJBot
+from TechVJ.bot import TechVJBot, multi_clients, work_loads
 from TechVJ.util.file_properties import get_file_ids
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,12 @@ TELEGRAM_DOWNLOAD_TIMEOUT = int(
 BUCKET_UPLOAD_TIMEOUT = int(
     os.environ.get("BUCKET_UPLOAD_TIMEOUT", "900")
 )
+
+# How many bot clients can split a single file's download across. Only
+# helps if you've actually set up extra bot tokens (MULTI_TOKEN1, etc.) -
+# with just one client this is a no-op and falls back to single-client
+# streaming, same as before.
+MIGRATION_MAX_PARALLEL_CLIENTS = max(1, int(os.environ.get("BUCKET_MIGRATION_PARALLEL_CLIENTS", "4")))
 
 # Multipart uploads are substantially more reliable for large video files.
 TRANSFER_CONFIG = TransferConfig(
@@ -220,72 +227,109 @@ def _abort_multipart(key: str, upload_id: str):
         logger.exception("Failed to abort multipart upload for %s", key)
 
 
-async def _pipe_telegram_to_bucket(message, key: str, mime_type: str, file_name: str) -> int:
-    """Streams Telegram media straight into a bucket multipart upload.
+def _select_migration_clients():
+    """Pick up to MIGRATION_MAX_PARALLEL_CLIENTS bot clients to split a
+    single file's download across, preferring whichever are least busy
+    serving other requests right now (same work_loads counters the viewer
+    streamer uses). Falls back to just TechVJBot if no extra clients were
+    configured.
+    """
+    if not multi_clients:
+        return [TechVJBot]
+    ordered = sorted(multi_clients.items(), key=lambda kv: work_loads.get(kv[0], 0))
+    chosen = [client for _, client in ordered[:MIGRATION_MAX_PARALLEL_CLIENTS]]
+    return chosen or [TechVJBot]
 
-    Download (Telegram -> Railway) and upload (Railway -> bucket) run
-    concurrently via a producer/consumer pipeline, instead of downloading
-    the whole file to disk first and only then uploading it. Total time is
-    roughly the SLOWER of the two steps instead of the SUM of both, and
-    nothing is ever sent to a viewer - only to the bucket. Memory use is
-    bounded by the queue size (a handful of parts at a time), not the full
-    file size.
+
+async def _pipe_telegram_to_bucket(message, key: str, mime_type: str, file_name: str, size: int) -> int:
+    """Streams Telegram media straight into a bucket multipart upload,
+    splitting the download across multiple bot clients in parallel when
+    more than one is available (see MIGRATION_MAX_PARALLEL_CLIENTS).
+
+    The file is divided into contiguous, part-aligned slices - one per
+    worker. Each worker downloads its own slice from Telegram (via its own
+    client) and uploads each completed 16 MiB part to the bucket as soon as
+    it's ready, so workers make progress independently instead of taking
+    turns, and within each worker download and upload still overlap rather
+    than running sequentially. With N clients available, wall-clock time
+    for the Telegram side drops roughly N-fold on top of that overlap.
+    With only one client configured, this behaves the same as the
+    single-worker streaming path did before.
     """
     part_size = TRANSFER_CONFIG.multipart_chunksize  # 16 MiB
+    chunk_size = 1024 * 1024  # stream_media's fixed chunk size
+    part_chunks = part_size // chunk_size
+
     upload_id = await asyncio.to_thread(_create_multipart, key, mime_type, file_name)
 
-    queue: "asyncio.Queue" = asyncio.Queue(maxsize=4)
+    total_chunks = math.ceil(size / chunk_size)
+    total_parts = math.ceil(total_chunks / part_chunks)
+
+    clients = _select_migration_clients()
+    num_workers = max(1, min(len(clients), total_parts))
+
+    # Split parts into contiguous, roughly-equal ranges across workers.
+    base, extra = divmod(total_parts, num_workers)
+    ranges = []
+    start_part = 0
+    for w in range(num_workers):
+        count = base + (1 if w < extra else 0)
+        if count > 0:
+            ranges.append((start_part, start_part + count))
+            start_part += count
+
     parts: list = []
-    total_size = 0
-    error: Optional[BaseException] = None
+    total_size_holder = [0]
 
-    async def producer():
-        nonlocal total_size
-        buffer = bytearray()
-        part_number = 1
-        async for chunk in TechVJBot.stream_media(message, limit=0):
-            buffer += chunk
-            total_size += len(chunk)
-            while len(buffer) >= part_size:
-                data = bytes(buffer[:part_size])
-                del buffer[:part_size]
-                await queue.put((part_number, data))
-                part_number += 1
-        if buffer:
-            await queue.put((part_number, bytes(buffer)))
-        await queue.put(None)
+    async def run_worker(client, part_start: int, part_end: int):
+        msg = await client.get_messages(message.chat.id, message.id)
+        chunk_offset = part_start * part_chunks
+        chunk_count = min(part_end * part_chunks, total_chunks) - chunk_offset
 
-    async def consumer():
-        nonlocal error
-        while True:
-            item = await queue.get()
-            if item is None:
-                return
-            part_number, data = item
-            try:
-                part = await asyncio.to_thread(_upload_part, key, upload_id, part_number, data)
-                parts.append(part)
-            except Exception as e:
-                error = e
-                return
+        local_queue: "asyncio.Queue" = asyncio.Queue(maxsize=2)
 
-    try:
+        async def producer():
+            buffer = bytearray()
+            part_number = part_start + 1
+            async for chunk in client.stream_media(msg, limit=chunk_count, offset=chunk_offset):
+                buffer += chunk
+                total_size_holder[0] += len(chunk)
+                while len(buffer) >= part_size:
+                    data = bytes(buffer[:part_size])
+                    del buffer[:part_size]
+                    await local_queue.put((part_number, data))
+                    part_number += 1
+            if buffer:
+                await local_queue.put((part_number, bytes(buffer)))
+            await local_queue.put(None)
+
+        async def consumer():
+            while True:
+                item = await local_queue.get()
+                if item is None:
+                    return
+                part_number, data = item
+                uploaded = await asyncio.to_thread(_upload_part, key, upload_id, part_number, data)
+                parts.append(uploaded)
+
         await asyncio.gather(producer(), consumer())
-    except Exception as e:
-        error = error or e
+
+    results = await asyncio.gather(
+        *[run_worker(clients[i % len(clients)], p_start, p_end) for i, (p_start, p_end) in enumerate(ranges)],
+        return_exceptions=True,
+    )
+    error = next((r for r in results if isinstance(r, Exception)), None)
 
     if error:
         await asyncio.to_thread(_abort_multipart, key, upload_id)
         raise error
 
     if not parts:
-        # Zero-byte file, nothing was ever queued - abort rather than
-        # complete with no parts.
         await asyncio.to_thread(_abort_multipart, key, upload_id)
         raise RuntimeError("Telegram media stream produced no data.")
 
     await asyncio.to_thread(_complete_multipart, key, upload_id, parts)
-    return total_size
+    return total_size_holder[0]
 
 
 async def ensure_uploaded(file_id: int):
@@ -357,7 +401,7 @@ async def ensure_uploaded(file_id: int):
             )
             try:
                 actual_size = await asyncio.wait_for(
-                    _pipe_telegram_to_bucket(message, key, file_data.mime_type, file_name),
+                    _pipe_telegram_to_bucket(message, key, file_data.mime_type, file_name, size),
                     timeout=max(TELEGRAM_DOWNLOAD_TIMEOUT, BUCKET_UPLOAD_TIMEOUT),
                 )
             except asyncio.TimeoutError:
