@@ -1,10 +1,13 @@
 import hashlib
 import hmac
+import logging
 import os
 import time
 from urllib.parse import urlencode
 
 from info import BOT_TOKEN, URL
+
+logger = logging.getLogger(__name__)
 
 LINK_EXPIRE_HOURS = float(os.environ.get("LINK_EXPIRE_HOURS", "24"))
 LINK_EXPIRE_SECONDS = max(60, int(LINK_EXPIRE_HOURS * 3600))
@@ -28,6 +31,18 @@ def make_stream_links(message_id: int, file_name: str, secure_hash: str):
     expires = int(time.time()) + LINK_EXPIRE_SECONDS
     stream = make_link("watch", message_id, file_name, secure_hash, expires)
     download = make_link("", message_id, file_name, secure_hash, expires)
+
+    # Start migrating this file into the Railway Bucket the moment the link
+    # is handed out, not when the viewer clicks it. By the time they open
+    # the watch page, the file is often already cached (or well on its way),
+    # so the page's auto-refresh only has to wait out the remainder.
+    try:
+        from TechVJ.util.bucket_storage import bucket_enabled, migrate_in_background
+        if bucket_enabled():
+            migrate_in_background(message_id)
+    except Exception:
+        logger.exception("Failed to pre-warm bucket cache for message_id=%s", message_id)
+
     return stream, download
 
 
