@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -189,6 +188,106 @@ async def maybe_cleanup_old_objects():
             logger.exception("Bucket cleanup failed")
 
 
+def _create_multipart(key: str, mime_type: str, file_name: str) -> str:
+    resp = _client().create_multipart_upload(
+        Bucket=BUCKET_NAME,
+        Key=key,
+        ContentType=mime_type or "application/octet-stream",
+        ContentDisposition=f'inline; filename="{Path(file_name).name}"',
+        CacheControl="private, max-age=0",
+    )
+    return resp["UploadId"]
+
+
+def _upload_part(key: str, upload_id: str, part_number: int, data: bytes) -> dict:
+    resp = _client().upload_part(
+        Bucket=BUCKET_NAME, Key=key, PartNumber=part_number, UploadId=upload_id, Body=data,
+    )
+    return {"ETag": resp["ETag"], "PartNumber": part_number}
+
+
+def _complete_multipart(key: str, upload_id: str, parts: list):
+    _client().complete_multipart_upload(
+        Bucket=BUCKET_NAME, Key=key, UploadId=upload_id,
+        MultipartUpload={"Parts": sorted(parts, key=lambda p: p["PartNumber"])},
+    )
+
+
+def _abort_multipart(key: str, upload_id: str):
+    try:
+        _client().abort_multipart_upload(Bucket=BUCKET_NAME, Key=key, UploadId=upload_id)
+    except Exception:
+        logger.exception("Failed to abort multipart upload for %s", key)
+
+
+async def _pipe_telegram_to_bucket(message, key: str, mime_type: str, file_name: str) -> int:
+    """Streams Telegram media straight into a bucket multipart upload.
+
+    Download (Telegram -> Railway) and upload (Railway -> bucket) run
+    concurrently via a producer/consumer pipeline, instead of downloading
+    the whole file to disk first and only then uploading it. Total time is
+    roughly the SLOWER of the two steps instead of the SUM of both, and
+    nothing is ever sent to a viewer - only to the bucket. Memory use is
+    bounded by the queue size (a handful of parts at a time), not the full
+    file size.
+    """
+    part_size = TRANSFER_CONFIG.multipart_chunksize  # 16 MiB
+    upload_id = await asyncio.to_thread(_create_multipart, key, mime_type, file_name)
+
+    queue: "asyncio.Queue" = asyncio.Queue(maxsize=4)
+    parts: list = []
+    total_size = 0
+    error: Optional[BaseException] = None
+
+    async def producer():
+        nonlocal total_size
+        buffer = bytearray()
+        part_number = 1
+        async for chunk in TechVJBot.stream_media(message, limit=0):
+            buffer += chunk
+            total_size += len(chunk)
+            while len(buffer) >= part_size:
+                data = bytes(buffer[:part_size])
+                del buffer[:part_size]
+                await queue.put((part_number, data))
+                part_number += 1
+        if buffer:
+            await queue.put((part_number, bytes(buffer)))
+        await queue.put(None)
+
+    async def consumer():
+        nonlocal error
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            part_number, data = item
+            try:
+                part = await asyncio.to_thread(_upload_part, key, upload_id, part_number, data)
+                parts.append(part)
+            except Exception as e:
+                error = e
+                return
+
+    try:
+        await asyncio.gather(producer(), consumer())
+    except Exception as e:
+        error = error or e
+
+    if error:
+        await asyncio.to_thread(_abort_multipart, key, upload_id)
+        raise error
+
+    if not parts:
+        # Zero-byte file, nothing was ever queued - abort rather than
+        # complete with no parts.
+        await asyncio.to_thread(_abort_multipart, key, upload_id)
+        raise RuntimeError("Telegram media stream produced no data.")
+
+    await asyncio.to_thread(_complete_multipart, key, upload_id, parts)
+    return total_size
+
+
 async def ensure_uploaded(file_id: int):
     """Ensure a Telegram media file exists in Railway Bucket.
 
@@ -239,81 +338,36 @@ async def ensure_uploaded(file_id: int):
                 "Video delivery is paused to protect the Railway budget."
             )
 
-        tmp_path: Optional[str] = None
         reserved = True
         try:
-            suffix = Path(file_name).suffix or ".bin"
-            fd, tmp_path = tempfile.mkstemp(prefix="tcu_media_", suffix=suffix)
-            os.close(fd)
-
             logger.info("Migrating Telegram media %s (%s bytes) to Railway Bucket", unique_id, size)
             message = await TechVJBot.get_messages(int(LOG_CHANNEL), int(file_id))
             if message.empty:
                 raise RuntimeError("Source Telegram message was not found.")
 
-            # Pyrofork writes the Telegram file directly to disk; Railway ingress
-            # is not billed as network egress.
+            # Stream Telegram -> bucket concurrently instead of downloading
+            # the whole file to disk first. Railway ingress from Telegram is
+            # not billed as network egress; only the bucket upload counts.
             logger.info(
-                "Starting Telegram download: file=%s size=%s timeout=%ss",
-                unique_id,
-                size,
-                TELEGRAM_DOWNLOAD_TIMEOUT,
-            )
-            try:
-                downloaded = await asyncio.wait_for(
-                    TechVJBot.download_media(message, file_name=tmp_path),
-                    timeout=TELEGRAM_DOWNLOAD_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                raise RuntimeError(
-                    f"Telegram media download timed out after "
-                    f"{TELEGRAM_DOWNLOAD_TIMEOUT}s."
-                )
-
-            if not downloaded or not os.path.exists(tmp_path):
-                raise RuntimeError("Telegram media download failed.")
-
-            logger.info(
-                "Telegram download completed: file=%s actual_size=%s",
-                unique_id,
-                os.path.getsize(tmp_path),
-            )
-
-            actual_size = os.path.getsize(tmp_path)
-            if actual_size != size:
-                logger.warning("Telegram size mismatch: metadata=%s actual=%s", size, actual_size)
-
-            logger.info(
-                "Starting bucket upload: file=%s key=%s size=%s timeout=%ss",
+                "Starting piped Telegram->bucket transfer: file=%s key=%s size=%s timeout=%ss",
                 unique_id,
                 key,
-                actual_size,
+                size,
                 BUCKET_UPLOAD_TIMEOUT,
             )
-
-            def _upload():
-                client = _client()
-                client.upload_file(
-                    tmp_path,
-                    BUCKET_NAME,
-                    key,
-                    ExtraArgs={
-                        "ContentType": file_data.mime_type or "application/octet-stream",
-                        "ContentDisposition": f'inline; filename="{Path(file_name).name}"',
-                        "CacheControl": "private, max-age=0",
-                    },
-                    Config=TRANSFER_CONFIG,
-                )
-
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(_upload),
-                    timeout=BUCKET_UPLOAD_TIMEOUT,
+                actual_size = await asyncio.wait_for(
+                    _pipe_telegram_to_bucket(message, key, file_data.mime_type, file_name),
+                    timeout=max(TELEGRAM_DOWNLOAD_TIMEOUT, BUCKET_UPLOAD_TIMEOUT),
                 )
             except asyncio.TimeoutError:
                 raise RuntimeError(
-                    f"Bucket upload timed out after {BUCKET_UPLOAD_TIMEOUT}s."
+                    f"Media transfer timed out after "
+                    f"{max(TELEGRAM_DOWNLOAD_TIMEOUT, BUCKET_UPLOAD_TIMEOUT)}s."
                 )
+
+            if actual_size != size:
+                logger.warning("Telegram size mismatch: metadata=%s actual=%s", size, actual_size)
 
             # Verify the object before telling the browser that it is ready.
             logger.info("Verifying bucket object: %s", key)
@@ -343,14 +397,54 @@ async def ensure_uploaded(file_id: int):
             if reserved:
                 await asyncio.to_thread(_release_upload, size)
             raise
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
 
 
 async def get_presigned_url(file_id: int, expires: int) -> str:
     key, _ = await ensure_uploaded(file_id)
     return await asyncio.to_thread(_presign, key, int(expires))
+
+
+async def get_cached_presigned_url(file_id: int, expires: int) -> Optional[str]:
+    """Return a presigned bucket URL only if the object is already migrated.
+
+    Never triggers a Telegram download or bucket upload — this is the fast
+    path used to decide whether we can redirect immediately (cheap) or need
+    to show the "preparing" page instead of making the viewer wait on a
+    blocked connection.
+    """
+    if not bucket_enabled() or _cache_col is None:
+        return None
+
+    file_data = await get_file_ids(TechVJBot, int(LOG_CHANNEL), int(file_id))
+    unique_id = str(file_data.unique_id)
+    file_name = file_data.file_name or f"{unique_id}.bin"
+    key = _object_key(unique_id, file_name)
+
+    cached = _cache_col.find_one({"_id": unique_id}, {"key": 1})
+    if not cached or cached.get("key") != key:
+        return None
+
+    try:
+        exists = await asyncio.to_thread(_head_object, key)
+    except Exception:
+        logger.exception("Bucket cache verification failed for %s", unique_id)
+        return None
+
+    if not exists:
+        return None
+    return await asyncio.to_thread(_presign, key, int(expires))
+
+
+def migrate_in_background(file_id: int):
+    """Fire-and-forget Telegram -> bucket migration.
+
+    Used to pre-warm the cache (when a link is generated) or to make sure a
+    migration is running when a viewer hits the "preparing" page.
+    """
+    async def _run():
+        try:
+            await ensure_uploaded(file_id)
+        except Exception:
+            logger.exception("Background bucket migration failed for file_id=%s", file_id)
+
+    asyncio.create_task(_run())
