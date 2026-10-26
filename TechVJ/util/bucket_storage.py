@@ -17,6 +17,19 @@ from TechVJ.util.file_properties import get_file_ids
 
 logger = logging.getLogger(__name__)
 
+
+class BucketAccessError(RuntimeError):
+    pass
+
+
+_FAIL_COOLDOWN = 120  # seconds
+_failed_at = {}
+_inflight = set()
+
+
+def recently_failed(file_id: int) -> bool:
+    return time.time() - _failed_at.get(int(file_id), 0) < _FAIL_COOLDOWN
+
 BUCKET_NAME = os.environ.get("BUCKET", "").strip()
 BUCKET_ENDPOINT = os.environ.get("ENDPOINT", "").strip()
 BUCKET_ACCESS_KEY = os.environ.get("ACCESS_KEY_ID", "").strip()
@@ -109,7 +122,33 @@ def _head_object(key: str) -> bool:
         code = str(e.response.get("Error", {}).get("Code", ""))
         if code in {"404", "NoSuchKey", "NotFound"}:
             return False
+        if code in {"403", "Forbidden", "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
+            raise BucketAccessError(
+                f"Bucket denied HeadObject ({code}) for bucket={BUCKET_NAME!r} "
+                f"endpoint={BUCKET_ENDPOINT!r}. Check BUCKET / ENDPOINT / ACCESS_KEY_ID / "
+                "SECRET_ACCESS_KEY / REGION match the SAME Railway bucket's Variables tab."
+            ) from e
         raise
+
+
+def bucket_selfcheck() -> bool:
+    """Put/head/delete a tiny object so credential problems show up at startup."""
+    if not bucket_enabled():
+        logger.error("Bucket selfcheck: BUCKET/ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY not all set.")
+        return False
+    key = "healthcheck/selfcheck.txt"
+    try:
+        c = _client()
+        c.put_object(Bucket=BUCKET_NAME, Key=key, Body=b"ok")
+        c.head_object(Bucket=BUCKET_NAME, Key=key)
+        c.delete_object(Bucket=BUCKET_NAME, Key=key)
+        logger.info("Bucket selfcheck OK (bucket=%s)", BUCKET_NAME)
+        return True
+    except ClientError as e:
+        logger.error("Bucket selfcheck FAILED: %s", e.response.get("Error"))
+    except Exception:
+        logger.exception("Bucket selfcheck FAILED")
+    return False
 
 
 def _presign(key: str, expires: int) -> str:
@@ -480,15 +519,23 @@ async def get_cached_presigned_url(file_id: int, expires: int) -> Optional[str]:
 
 
 def migrate_in_background(file_id: int):
-    """Fire-and-forget Telegram -> bucket migration.
+    """Fire-and-forget Telegram -> bucket migration (deduped, with failure cooldown)."""
+    file_id = int(file_id)
+    if file_id in _inflight or recently_failed(file_id):
+        return
 
-    Used to pre-warm the cache (when a link is generated) or to make sure a
-    migration is running when a viewer hits the "preparing" page.
-    """
     async def _run():
+        _inflight.add(file_id)
         try:
             await ensure_uploaded(file_id)
+            _failed_at.pop(file_id, None)
+        except BucketAccessError as e:
+            _failed_at[file_id] = time.time()
+            logger.error("Background bucket migration failed for file_id=%s: %s", file_id, e)
         except Exception:
+            _failed_at[file_id] = time.time()
             logger.exception("Background bucket migration failed for file_id=%s", file_id)
+        finally:
+            _inflight.discard(file_id)
 
     asyncio.create_task(_run())
