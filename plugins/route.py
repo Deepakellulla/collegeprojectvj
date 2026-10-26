@@ -13,7 +13,7 @@ from TechVJ.util.custom_dl import ByteStreamer
 from TechVJ.util.time_format import get_readable_time
 from TechVJ.util.render_template import render_page
 from TechVJ.util.link_utils import validate_link
-from TechVJ.util.bucket_storage import bucket_enabled, get_cached_presigned_url, migrate_in_background
+from TechVJ.util.bucket_storage import bucket_enabled, get_cached_presigned_url, migrate_in_background, recently_failed
 from database.connections_mdb import increment_video_download
 
 routes = web.RouteTableDef()
@@ -154,6 +154,10 @@ async def bucket_media_handler(request: web.Request):
         # the case this link was generated before the pre-warm code existed,
         # or the background task died) and show a lightweight waiting page
         # instead of hanging the request or falling back to Railway streaming.
+        if recently_failed(file_id):
+            raise web.HTTPServiceUnavailable(
+                text="This video could not be prepared right now. Please try again in a few minutes."
+            )
         migrate_in_background(file_id)
         return _preparing_response(file_id)
     except web.HTTPException:
