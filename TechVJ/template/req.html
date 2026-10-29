@@ -756,6 +756,44 @@
         .stat-sep { width: 1px; height: 15px; background: var(--border2); }
         @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
 
+        /* ─── PROMO CAPTION ─── */
+        .promo-area { max-width: 900px; margin: 16px auto 0; padding: 0 14px; }
+        .promo-card {
+            position: relative; overflow: hidden;
+            border: 1px solid var(--border2);
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--card2), var(--card));
+            box-shadow: 0 10px 30px rgba(0,0,0,.35);
+            padding: 20px;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px; flex-wrap: wrap;
+        }
+        .promo-card::after {
+            content: ''; position: absolute; width: 200px; height: 200px; border-radius: 50%;
+            background: rgba(201,162,77,.10); filter: blur(50px); right: -80px; top: -100px;
+            pointer-events: none;
+        }
+        .promo-copy { flex: 1; min-width: 230px; position: relative; z-index: 1; }
+        .promo-line {
+            font-size: .88rem; line-height: 1.7; color: var(--text);
+        }
+        .promo-line.head {
+            font-family: var(--font-h); font-weight: 600; font-size: 1.05rem;
+            color: var(--accent-hi); margin-bottom: 2px;
+        }
+        .promo-line.trial { color: var(--muted2); }
+        .promo-cta {
+            position: relative; z-index: 1;
+            display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+            padding: 12px 22px; border-radius: 10px;
+            background: linear-gradient(135deg, #229ed9, #1880b5);
+            color: #fff; font-weight: 700; font-size: .85rem; text-decoration: none;
+            box-shadow: 0 5px 18px rgba(34,158,217,.3);
+            transition: all .22s ease;
+        }
+        .promo-cta:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(34,158,217,.42); color: #fff; }
+        @media (max-width: 520px) { .promo-cta { width: 100%; } }
+
         /* ─── ANIMATIONS ─── */
         @keyframes fadeUp {
             from { opacity: 0; transform: translateY(18px); }
@@ -866,6 +904,21 @@
             <line x1="2" y1="20" x2="2.01" y2="20"></line>
         </svg>
     </button>
+</div>
+
+<!-- ─── PROMO CAPTION ─── -->
+<div class="promo-area au d3">
+    <div class="promo-card">
+        <div class="promo-copy">
+            <div class="promo-line head">🌍 Telugu Entertainment, Wherever You Are!</div>
+            <div class="promo-line">📺 Live TV • Movies • Series • Cricket • Bigg Boss*</div>
+            <div class="promo-line trial">🎁 24-Hour Trial Available</div>
+            <div class="promo-line">👉 Get Started on Telegram: <strong>@OgAagaya</strong></div>
+        </div>
+        <a class="promo-cta" href="https://t.me/OgAagaya" target="_blank" rel="noopener sponsored">
+            Get Started →
+        </a>
+    </div>
 </div>
 
 <!-- ─── VIDEO STATS ─── -->
